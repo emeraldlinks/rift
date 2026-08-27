@@ -154,6 +154,10 @@ pub struct ConfigToml {
     /// Provider to use from the model_providers map.
     pub model_provider: Option<String>,
 
+    /// Ordered list of fallback provider IDs to try when the primary provider
+    /// is rate-limited (429) after retries are exhausted.
+    pub model_provider_fallback: Option<Vec<String>>,
+
     /// Size of the context window for the model, in tokens.
     pub model_context_window: Option<i64>,
 

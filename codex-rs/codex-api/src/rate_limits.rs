@@ -47,6 +47,19 @@ pub fn parse_all_rate_limits(headers: &HeaderMap) -> Vec<RateLimitSnapshot> {
         has_rate_limit_data(&snapshot).then_some(snapshot)
     }));
 
+    // Also parse standard OpenAI-compatible rate limit headers if present.
+    if let Some(snapshot) = parse_openai_compatible_rate_limits(headers) {
+        // Only add if it has data and we don't already have a codex snapshot with data
+        if has_rate_limit_data(&snapshot)
+            && !snapshots.iter().any(|s| {
+                s.limit_id.as_deref() == Some("codex")
+                    && (s.primary.is_some() || s.secondary.is_some())
+            })
+        {
+            snapshots.push(snapshot);
+        }
+    }
+
     snapshots
 }
 
@@ -269,6 +282,105 @@ fn normalize_limit_id(name: impl Into<String>) -> String {
     name.into().trim().to_ascii_lowercase().replace('-', "_")
 }
 
+/// Parses standard OpenAI-compatible rate limit headers.
+///
+/// These headers are used by most ChatCompletions-compatible providers:
+/// - `x-ratelimit-limit-requests`: Maximum requests per window
+/// - `x-ratelimit-remaining-requests`: Remaining requests in current window
+/// - `x-ratelimit-reset-requests`: Time until the request window resets (e.g., "1s", "1m")
+/// - `x-ratelimit-limit-tokens`: Maximum tokens per window
+/// - `x-ratelimit-remaining-tokens`: Remaining tokens in current window
+/// - `x-ratelimit-reset-tokens`: Time until the token window resets
+fn parse_openai_compatible_rate_limits(headers: &HeaderMap) -> Option<RateLimitSnapshot> {
+    // Check if any standard rate limit headers are present
+    let has_request_limits = headers.contains_key("x-ratelimit-limit-requests")
+        || headers.contains_key("x-ratelimit-remaining-requests")
+        || headers.contains_key("x-ratelimit-reset-requests");
+    let has_token_limits = headers.contains_key("x-ratelimit-limit-tokens")
+        || headers.contains_key("x-ratelimit-remaining-tokens")
+        || headers.contains_key("x-ratelimit-reset-tokens");
+
+    if !has_request_limits && !has_token_limits {
+        return None;
+    }
+
+    // Parse request-based rate limits
+    let primary = if has_request_limits {
+        let limit = parse_header_i64(headers, "x-ratelimit-limit-requests");
+        let remaining = parse_header_i64(headers, "x-ratelimit-remaining-requests");
+        let reset_str = parse_header_str(headers, "x-ratelimit-reset-requests");
+
+        match (limit, remaining) {
+            (Some(limit), Some(remaining)) if limit > 0 => {
+                let used_percent = ((limit - remaining) as f64 / limit as f64) * 100.0;
+                let resets_at = reset_str.and_then(parse_duration_to_seconds);
+                Some(RateLimitWindow {
+                    used_percent,
+                    window_minutes: None,
+                    resets_at,
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Parse token-based rate limits (as secondary window)
+    let secondary = if has_token_limits {
+        let limit = parse_header_i64(headers, "x-ratelimit-limit-tokens");
+        let remaining = parse_header_i64(headers, "x-ratelimit-remaining-tokens");
+        let reset_str = parse_header_str(headers, "x-ratelimit-reset-tokens");
+
+        match (limit, remaining) {
+            (Some(limit), Some(remaining)) if limit > 0 => {
+                let used_percent = ((limit - remaining) as f64 / limit as f64) * 100.0;
+                let resets_at = reset_str.and_then(parse_duration_to_seconds);
+                Some(RateLimitWindow {
+                    used_percent,
+                    window_minutes: None,
+                    resets_at,
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Only return if we have some data
+    if primary.is_some() || secondary.is_some() {
+        Some(RateLimitSnapshot {
+            limit_id: Some("openai_compatible".to_string()),
+            limit_name: None,
+            primary,
+            secondary,
+            credits: None,
+            individual_limit: None,
+            spend_control_reached: None,
+            plan_type: None,
+            rate_limit_reached_type: None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Parse a duration string like "1s", "1m", "1h" into seconds.
+fn parse_duration_to_seconds(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if let Some(num_str) = s.strip_suffix('s') {
+        num_str.parse::<i64>().ok()
+    } else if let Some(num_str) = s.strip_suffix('m') {
+        num_str.parse::<i64>().ok().map(|m| m * 60)
+    } else if let Some(num_str) = s.strip_suffix('h') {
+        num_str.parse::<i64>().ok().map(|h| h * 3600)
+    } else {
+        // Try parsing as plain seconds
+        s.parse::<i64>().ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +488,60 @@ mod tests {
         assert_eq!(updates[0].primary, None);
         assert_eq!(updates[0].secondary, None);
         assert_eq!(updates[0].credits, None);
+    }
+
+    #[test]
+    fn parse_openai_compatible_rate_limits_parses_request_and_token_limits() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-limit-requests",
+            HeaderValue::from_static("1000"),
+        );
+        headers.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("950"),
+        );
+        headers.insert(
+            "x-ratelimit-reset-requests",
+            HeaderValue::from_static("30s"),
+        );
+        headers.insert(
+            "x-ratelimit-limit-tokens",
+            HeaderValue::from_static("100000"),
+        );
+        headers.insert(
+            "x-ratelimit-remaining-tokens",
+            HeaderValue::from_static("80000"),
+        );
+        headers.insert(
+            "x-ratelimit-reset-tokens",
+            HeaderValue::from_static("1m"),
+        );
+
+        let snapshot = parse_openai_compatible_rate_limits(&headers).expect("snapshot");
+        assert_eq!(snapshot.limit_id.as_deref(), Some("openai_compatible"));
+
+        let primary = snapshot.primary.expect("primary");
+        assert!((primary.used_percent - 5.0).abs() < 0.01);
+        assert_eq!(primary.resets_at, Some(30));
+
+        let secondary = snapshot.secondary.expect("secondary");
+        assert!((secondary.used_percent - 20.0).abs() < 0.01);
+        assert_eq!(secondary.resets_at, Some(60));
+    }
+
+    #[test]
+    fn parse_openai_compatible_rate_limits_returns_none_when_no_headers() {
+        let headers = HeaderMap::new();
+        assert!(parse_openai_compatible_rate_limits(&headers).is_none());
+    }
+
+    #[test]
+    fn parse_duration_to_seconds_parses_various_formats() {
+        assert_eq!(parse_duration_to_seconds("30s"), Some(30));
+        assert_eq!(parse_duration_to_seconds("1m"), Some(60));
+        assert_eq!(parse_duration_to_seconds("2h"), Some(7200));
+        assert_eq!(parse_duration_to_seconds("120"), Some(120));
+        assert_eq!(parse_duration_to_seconds("invalid"), None);
     }
 }

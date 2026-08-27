@@ -629,6 +629,10 @@ pub struct Config {
     /// Key into the model_providers map that specifies which provider to use.
     pub model_provider_id: String,
 
+    /// Ordered list of fallback provider IDs to try when the primary provider
+    /// is rate-limited after retries are exhausted.
+    pub model_provider_fallback: Vec<String>,
+
     /// Info needed to make an API request to the model.
     pub model_provider: ModelProviderInfo,
 
@@ -4098,6 +4102,7 @@ impl Config {
                 .model_auto_compact_token_limit_scope
                 .unwrap_or_default(),
             model_provider_id,
+            model_provider_fallback: cfg.model_provider_fallback.unwrap_or_default(),
             model_provider,
             cwd: resolved_cwd,
             workspace_roots: workspace_roots.clone(),

@@ -96,7 +96,10 @@ where
                     .should_retry(&err, attempt, policy.max_attempts) =>
             {
                 let retry_attempt = attempt + 1;
-                let delay = backoff(policy.base_delay, retry_attempt);
+                // Use Retry-After header if present, otherwise exponential backoff
+                let delay = extract_retry_after_delay(&err).unwrap_or_else(|| {
+                    backoff(policy.base_delay, retry_attempt)
+                });
                 crate::record_retry!(retry_attempt, delay, RetryOperation::HttpRequest);
                 tokio::time::sleep(delay).await;
             }
@@ -104,4 +107,23 @@ where
         }
     }
     Err(TransportError::RetryLimit)
+}
+
+/// Extract the delay from a Retry-After header if present in the error.
+fn extract_retry_after_delay(err: &TransportError) -> Option<Duration> {
+    let headers = match err {
+        TransportError::Http { headers, .. } => headers.as_ref()?,
+        _ => return None,
+    };
+
+    let retry_after = headers.get("retry-after")?.to_str().ok()?;
+
+    // Try parsing as integer seconds
+    if let Ok(seconds) = retry_after.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    // Try parsing as HTTP date (seconds since epoch)
+    // For simplicity, we just use a default delay if it's a date
+    None
 }

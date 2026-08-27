@@ -54,6 +54,7 @@ mod marketplace_cmd;
 mod mcp_cmd;
 mod migrate_rollouts;
 mod plugin_cmd;
+mod model_cmd;
 mod provider_cmd;
 mod queue_cmd;
 mod remote_control_cmd;
@@ -66,6 +67,7 @@ mod wsl_paths;
 use crate::mcp_cmd::McpCli;
 use crate::plugin_cmd::PluginCli;
 use crate::plugin_cmd::PluginSubcommand;
+use crate::model_cmd::ModelCli;
 use crate::provider_cmd::ProviderCli;
 use crate::queue_cmd::QueueCommand;
 use crate::remote_control_cmd::RemoteControlCommand;
@@ -153,6 +155,9 @@ enum Subcommand {
 
     /// Manage model providers (add, list, remove, test custom providers).
     Provider(ProviderCli),
+
+    /// Manage models (list, search, switch default model).
+    Model(ModelCli),
 
     /// Manage Codex plugins.
     Plugin(PluginCli),
@@ -1224,6 +1229,20 @@ async fn cli_main(
             let loader_overrides =
                 loader_overrides_for_profile(interactive.config_profile_v2.as_ref())?;
             provider_cli.run(loader_overrides).await?;
+        }
+        Some(Subcommand::Model(mut model_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "model",
+            )?;
+            prepend_config_flags(
+                &mut model_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            let loader_overrides =
+                loader_overrides_for_profile(interactive.config_profile_v2.as_ref())?;
+            model_cli.run(loader_overrides).await?;
         }
         Some(Subcommand::Plugin(plugin_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -2450,6 +2469,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::RemoteControl(remote_control)) => Some(remote_control.subcommand_name()),
         Some(Subcommand::Mcp(_)) => Some("mcp"),
         Some(Subcommand::Provider(_)) => Some("provider"),
+        Some(Subcommand::Model(_)) => Some("model"),
         Some(Subcommand::Plugin(_)) => Some("plugin"),
         Some(Subcommand::MigrateRollouts(_)) => Some("migrate-rollouts"),
         #[cfg(any(target_os = "macos", target_os = "windows"))]

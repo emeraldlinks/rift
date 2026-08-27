@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            arch: aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            arch: x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            arch: aarch64
+
+    runs-on: ${{ matrix.os }}
+    name: Build (${{ matrix.target }})
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        working-directory: codex-rs
+        run: |
+          cargo build --release --bin rift --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          BINARY_NAME="rift-${{ matrix.target }}"
+          cp codex-rs/target/${{ matrix.target }}/release/rift "$BINARY_NAME"
+          tar czf "${BINARY_NAME}.tar.gz" "$BINARY_NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rift-${{ matrix.target }}
+          path: rift-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || inputs.tag }}
+          name: "Rift ${{ github.ref_name || inputs.tag }}"
+          body: |
+            ## Install
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/emeraldlinks/rift/main/scripts/install/install-rift.sh | sh
+            ```
+          files: rift-*.tar.gz
+          draft: false
+          prerelease: false

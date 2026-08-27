@@ -16,6 +16,7 @@ use crate::cloud_config;
 /// - `add`    — add a custom provider to ~/.codex/config.toml
 /// - `remove` — remove a user-configured provider
 /// - `test`   — test provider connectivity with a simple request
+/// - `status` — check connectivity to all configured providers at once
 #[derive(Debug, clap::Parser)]
 pub struct ProviderCli {
     #[clap(flatten)]
@@ -29,8 +30,12 @@ pub struct ProviderCli {
 pub enum ProviderSubcommand {
     List(ListArgs),
     Add(AddArgs),
+    Edit(EditArgs),
     Remove(RemoveArgs),
+    Models(ModelsArgs),
     Test(TestArgs),
+    Login(LoginArgs),
+    Status(StatusArgs),
 }
 
 #[derive(Debug, clap::Parser)]
@@ -87,6 +92,67 @@ pub struct TestArgs {
     pub model: Option<String>,
 }
 
+#[derive(Debug, clap::Parser)]
+pub struct EditArgs {
+    /// Provider ID to edit (must be a custom provider).
+    pub id: String,
+
+    /// New display name.
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// New base URL.
+    #[arg(long)]
+    pub base_url: Option<String>,
+
+    /// New wire protocol: "chat_completions" or "responses".
+    #[arg(long)]
+    pub protocol: Option<String>,
+
+    /// New environment variable for API key.
+    #[arg(long)]
+    pub env_key: Option<String>,
+
+    /// New bearer token (not recommended, prefer env_key).
+    #[arg(long)]
+    pub bearer_token: Option<String>,
+}
+
+#[derive(Debug, clap::Parser)]
+pub struct ModelsArgs {
+    /// Provider ID to list models for.
+    pub id: String,
+
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Parser)]
+pub struct LoginArgs {
+    /// Provider ID to authenticate with.
+    pub id: String,
+
+    /// API key to set (will prompt if not provided).
+    #[arg(long)]
+    pub api_key: Option<String>,
+
+    /// Name of the environment variable to write to (defaults to provider's env_key).
+    #[arg(long)]
+    pub env_key: Option<String>,
+}
+
+#[derive(Debug, clap::Parser)]
+pub struct StatusArgs {
+    /// Only check custom providers (exclude built-in).
+    #[arg(long)]
+    pub custom_only: bool,
+
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 impl ProviderCli {
     pub async fn run(self, loader_overrides: codex_core::config::LoaderOverrides) -> Result<()> {
         let ProviderCli {
@@ -102,17 +168,171 @@ impl ProviderCli {
             ProviderSubcommand::Add(args) => {
                 run_add(&config_overrides, args).await?;
             }
+            ProviderSubcommand::Edit(args) => {
+                run_edit(&config_overrides, args).await?;
+            }
             ProviderSubcommand::Remove(args) => {
                 run_remove(&config_overrides, args).await?;
+            }
+            ProviderSubcommand::Models(args) => {
+                let config = cloud_config::load_config(&config_overrides, loader_overrides).await?;
+                run_models(&config, args).await?;
             }
             ProviderSubcommand::Test(args) => {
                 let config = cloud_config::load_config(&config_overrides, loader_overrides).await?;
                 run_test(&config, args).await?;
             }
+            ProviderSubcommand::Login(args) => {
+                run_login(&config_overrides, args).await?;
+            }
+            ProviderSubcommand::Status(args) => {
+                let config = cloud_config::load_config(&config_overrides, loader_overrides).await?;
+                run_status(&config, args).await?;
+            }
         }
 
-        Ok(())
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct ProviderStatus {
+    id: String,
+    name: String,
+    protocol: String,
+    has_api_key: bool,
+    status: String,
+    status_code: Option<u16>,
+    latency_ms: Option<u64>,
+    error: Option<String>,
+}
+
+async fn run_status(config: &codex_core::config::Config, args: StatusArgs) -> Result<()> {
+    let providers = &config.model_providers;
+
+    let providers_to_check: Vec<_> = if args.custom_only {
+        providers
+            .iter()
+            .filter(|(k, _)| !BUILT_IN_PROVIDER_IDS.contains(&k.as_str()))
+            .collect()
+    } else {
+        providers.iter().collect()
+    };
+
+    if providers_to_check.is_empty() {
+        println!("No providers to check.");
+        return Ok(());
     }
+
+    println!("Checking {} providers...\n", providers_to_check.len());
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let mut statuses = Vec::new();
+
+    for (id, info) in &providers_to_check {
+        let has_api_key = info
+            .env_key
+            .as_ref()
+            .is_some_and(|key| std::env::var(key).is_ok());
+
+        let base_url = info.base_url.as_deref().unwrap_or("https://api.openai.com/v1");
+        let url = format!("{base_url}/models");
+
+        let start = std::time::Instant::now();
+        let mut request = client.get(&url);
+
+        if let Some(ref env_key) = info.env_key {
+            if let Ok(key) = std::env::var(env_key) {
+                request = request.bearer_auth(&key);
+            }
+        }
+
+        if let Some(ref headers) = info.http_headers {
+            for (name, value) in headers {
+                request = request.header(name, value.as_str());
+            }
+        }
+
+        let (status_str, status_code, latency_ms, error) = match request.send().await {
+            Ok(response) => {
+                let latency = start.elapsed().as_millis() as u64;
+                let code = response.status().as_u16();
+                let status = if response.status().is_success() {
+                    "healthy".to_string()
+                } else if code == 401 {
+                    "auth_failed".to_string()
+                } else if code == 403 {
+                    "forbidden".to_string()
+                } else if code == 429 {
+                    "rate_limited".to_string()
+                } else {
+                    format!("error_{code}")
+                };
+                (status, Some(code), Some(latency), None)
+            }
+            Err(e) => {
+                let latency = start.elapsed().as_millis() as u64;
+                ("unreachable".to_string(), None, Some(latency), Some(e.to_string()))
+            }
+        };
+
+        statuses.push(ProviderStatus {
+            id: id.to_string(),
+            name: info.name.clone(),
+            protocol: info.wire_api.to_string(),
+            has_api_key,
+            status: status_str,
+            status_code,
+            latency_ms,
+            error,
+        });
+    }
+
+    if args.json {
+        let output = serde_json::to_string_pretty(&statuses)?;
+        println!("{output}");
+        return Ok(());
+    }
+
+    println!(
+        "{:<20} {:<25} {:<15} {:<8} {:<12} {:<10} {}",
+        "ID", "Name", "Protocol", "Key", "Status", "Latency", "Code"
+    );
+    println!("{}", "-".repeat(105));
+
+    for s in &statuses {
+        let key = if s.has_api_key { "yes" } else { "no" };
+        let latency = s
+            .latency_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_default();
+        let code = s
+            .status_code
+            .map(|c| c.to_string())
+            .unwrap_or_default();
+        let status_display = match s.status.as_str() {
+            "healthy" => "healthy".to_string(),
+            "auth_failed" => "AUTH FAILED".to_string(),
+            "forbidden" => "FORBIDDEN".to_string(),
+            "rate_limited" => "RATE LIMITED".to_string(),
+            "unreachable" => "UNREACHABLE".to_string(),
+            other => other.to_string(),
+        };
+
+        println!(
+            "{:<20} {:<25} {:<15} {:<8} {:<12} {:<10} {}",
+            s.id, s.name, s.protocol, key, status_display, latency, code,
+        );
+    }
+
+    let healthy = statuses.iter().filter(|s| s.status == "healthy").count();
+    let total = statuses.len();
+    println!();
+    println!("{healthy}/{total} providers healthy.");
+
+    Ok(())
 }
 
 fn run_list(config: &codex_core::config::Config, args: ListArgs) -> Result<()> {
@@ -395,6 +615,358 @@ async fn run_remove(config_overrides: &CliConfigOverrides, args: RemoveArgs) -> 
 
     println!("Provider `{id}` removed.");
     Ok(())
+}
+
+async fn run_edit(config_overrides: &CliConfigOverrides, args: EditArgs) -> Result<()> {
+    let overrides = config_overrides
+        .parse_overrides()
+        .map_err(anyhow::Error::msg)?;
+    let _config = codex_core::config::Config::load_with_cli_overrides(overrides)
+        .await
+        .context("failed to load configuration")?;
+
+    let id = &args.id;
+
+    if BUILT_IN_PROVIDER_IDS.contains(&id.as_str()) {
+        bail!("Cannot edit built-in provider `{id}`. Only custom providers can be edited.");
+    }
+
+    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+    let config_path = codex_home.join("config.toml");
+
+    if !config_path.exists() {
+        bail!("No config file found at {}", config_path.display());
+    }
+
+    let doc = std::fs::read_to_string(&config_path)?;
+
+    let section_header = format!("[model_providers.{id}]");
+    if !doc.contains(&section_header) {
+        bail!("Provider `{id}` not found in config.");
+    }
+
+    let lines: Vec<&str> = doc.lines().collect();
+    let mut new_lines = Vec::new();
+    let mut in_section = false;
+    let mut section_lines = Vec::new();
+
+    for line in &lines {
+        if line.trim() == section_header {
+            in_section = true;
+            section_lines.push(*line);
+            continue;
+        }
+        if in_section {
+            if line.trim().starts_with('[') && !line.trim().starts_with("[model_providers") {
+                in_section = false;
+                new_lines.extend(section_lines.iter());
+                new_lines.push(line);
+            } else if line.trim().starts_with("[model_providers.") {
+                in_section = false;
+                new_lines.extend(section_lines.iter());
+                new_lines.push(line);
+            } else {
+                section_lines.push(*line);
+            }
+        } else {
+            new_lines.push(line);
+        }
+    }
+    if in_section {
+        new_lines.extend(section_lines.iter());
+    }
+
+    let mut doc = new_lines.join("\n");
+
+    // Build replacement TOML for the section
+    let mut table = String::new();
+    table.push_str(&format!("[model_providers.{id}]\n"));
+
+    // Parse existing values from the section to preserve defaults
+    let mut existing_name = String::new();
+    let mut existing_base_url = String::new();
+    let mut existing_wire_api = String::new();
+    let mut existing_env_key = String::new();
+    let mut existing_bearer_token = String::new();
+
+    for line in section_lines.iter() {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("name = ") {
+            existing_name = val.trim_matches('"').to_string();
+        } else if let Some(val) = line.strip_prefix("base_url = ") {
+            existing_base_url = val.trim_matches('"').to_string();
+        } else if let Some(val) = line.strip_prefix("wire_api = ") {
+            existing_wire_api = val.trim_matches('"').to_string();
+        } else if let Some(val) = line.strip_prefix("env_key = ") {
+            existing_env_key = val.trim_matches('"').to_string();
+        } else if let Some(val) = line.strip_prefix("experimental_bearer_token = ") {
+            existing_bearer_token = val.trim_matches('"').to_string();
+        }
+    }
+
+    let name = args.name.unwrap_or(existing_name);
+    let base_url = args.base_url.unwrap_or(existing_base_url);
+    let wire_api = match args.protocol.as_deref() {
+        Some("chat_completions" | "chat") => "chat_completions".to_string(),
+        Some("responses") => "responses".to_string(),
+        None => existing_wire_api,
+        other => bail!("Unknown protocol `{other}`. Use `chat_completions` or `responses`."),
+    };
+    let env_key = args.env_key.or(if existing_env_key.is_empty() {
+        None
+    } else {
+        Some(existing_env_key)
+    });
+    let bearer_token = args.bearer_token.or(if existing_bearer_token.is_empty() {
+        None
+    } else {
+        Some(existing_bearer_token)
+    });
+
+    table.push_str(&format!("name = {name:?}\n"));
+    if !base_url.is_empty() {
+        table.push_str(&format!("base_url = {base_url:?}\n"));
+    }
+    table.push_str(&format!("wire_api = {wire_api:?}\n"));
+    if let Some(ref key) = env_key {
+        table.push_str(&format!("env_key = {key:?}\n"));
+    }
+    if let Some(ref token) = bearer_token {
+        table.push_str(&format!("experimental_bearer_token = {token:?}\n"));
+    }
+
+    // Replace the old section with the new one
+    let old_section = format!("[model_providers.{id}]");
+    if let Some(start) = doc.find(&old_section) {
+        // Find the end of the section (next [ section or end of file)
+        let after_start = start + old_section.len();
+        let rest = &doc[after_start..];
+        let end_offset = rest
+            .find("\n[")
+            .map(|i| after_start + i + 1)
+            .unwrap_or(doc.len());
+        doc.replace_range(start..end_offset, &table);
+    }
+
+    std::fs::write(&config_path, &doc)?;
+
+    println!("Provider `{id}` updated.");
+    println!("Config: {}", config_path.display());
+
+    Ok(())
+}
+
+async fn run_models(config: &codex_core::config::Config, args: ModelsArgs) -> Result<()> {
+    let providers = &config.model_providers;
+    let provider = providers
+        .get(&args.id)
+        .with_context(|| format!("Provider `{}` not found.", args.id))?;
+
+    let base_url = provider.base_url.as_deref().unwrap_or("https://api.openai.com/v1");
+    let url = format!("{base_url}/models");
+
+    println!("Fetching models for: {} ({})", provider.name, args.id);
+    println!("URL: {url}");
+    println!();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let mut request = client.get(&url);
+
+    // Add API key if available
+    if let Some(ref env_key) = provider.env_key {
+        if let Ok(key) = std::env::var(env_key) {
+            request = request.bearer_auth(&key);
+        }
+    }
+
+    // Add custom headers
+    if let Some(ref headers) = provider.http_headers {
+        for (name, value) in headers {
+            request = request.header(name, value.as_str());
+        }
+    }
+
+    let response = request.send().await?;
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!("Request failed with status {status}: {body}");
+    }
+
+    let body = response.text().await?;
+
+    // Try to parse as OpenAI-compatible model list
+    let models_response: serde_json::Value = serde_json::from_str(&body)?;
+
+    if args.json {
+        println!("{body}");
+        return Ok(());
+    }
+
+    // Extract models array
+    let models = models_response
+        .get("data")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if models.is_empty() {
+        println!("No models found.");
+        return Ok(());
+    }
+
+    println!("{:<40} {:<20} {:<15}", "Model ID", "Owned By", "Created");
+    println!("{}", "-".repeat(75));
+
+    let mut model_list: Vec<_> = models
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id")?.as_str()?;
+            let owned_by = m
+                .get("owned_by")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let created = m
+                .get("created")
+                .and_then(|v| v.as_i64())
+                .map(|ts| {
+                    let dt = chrono::DateTime::from_timestamp(ts, 0)?;
+                    Some(dt.format("%Y-%m-%d").to_string())
+                })
+                .flatten()
+                .unwrap_or_else(|| "unknown".to_string());
+            Some((id, owned_by, created))
+        })
+        .collect();
+
+    model_list.sort_by_key(|(id, _, _)| id.to_string());
+
+    for (id, owned_by, created) in &model_list {
+        println!("{id:<40} {owned_by:<20} {created:<15}");
+    }
+
+    println!();
+    println!("{} models found.", model_list.len());
+
+    Ok(())
+}
+
+async fn run_login(config_overrides: &CliConfigOverrides, args: LoginArgs) -> Result<()> {
+    let overrides = config_overrides
+        .parse_overrides()
+        .map_err(anyhow::Error::msg)?;
+    let _config = codex_core::config::Config::load_with_cli_overrides(overrides)
+        .await
+        .context("failed to load configuration")?;
+
+    let id = &args.id;
+
+    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+    let config_path = codex_home.join("config.toml");
+
+    // Find the provider's env_key from config or built-in
+    let env_key = if let Some(key) = args.env_key {
+        key
+    } else {
+        // Try to find the env_key from the provider config
+        let doc = if config_path.exists() {
+            std::fs::read_to_string(&config_path)?
+        } else {
+            String::new()
+        };
+
+        let section_header = format!("[model_providers.{id}]");
+        let mut found_env_key = String::new();
+
+        if doc.contains(&section_header) {
+            for line in doc.lines() {
+                let line = line.trim();
+                if line.starts_with(&section_header) {
+                    continue;
+                }
+                if let Some(val) = line.strip_prefix("env_key = ") {
+                    found_env_key = val.trim_matches('"').to_string();
+                    break;
+                }
+            }
+        }
+
+        if found_env_key.is_empty() {
+            bail!(
+                "No env_key found for provider `{id}`. \
+                 Use --env-key to specify the environment variable name, \
+                 or add env_key to the provider config."
+            );
+        }
+        found_env_key
+    };
+
+    // Get the API key
+    let api_key = match args.api_key {
+        Some(key) => key,
+        None => {
+            eprint!("Enter API key for {id}: ");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let input = input.trim().to_string();
+            if input.is_empty() {
+                bail!("API key is required.");
+            }
+            input
+        }
+    };
+
+    // Set the environment variable for the current session
+    std::env::set_var(&env_key, &api_key);
+
+    println!("API key set for provider `{id}`.");
+    println!("Environment variable: {env_key}");
+
+    // Check if there's already a shell profile entry
+    let shell_profile = detect_shell_profile();
+    if let Some(profile) = shell_profile {
+        let export_line = format!("export {env_key}=\"{api_key}\"");
+        let profile_content = std::fs::read_to_string(&profile).unwrap_or_default();
+
+        if profile_content.contains(&format!("export {env_key}=")) {
+            println!("\nNote: {env_key} is already set in {}", profile.display());
+            println!("To update, edit the file directly or remove the old entry.");
+        } else {
+            println!("\nTo persist this key, add to your shell profile ({}):", profile.display());
+            println!("  {export_line}");
+        }
+    } else {
+        println!("\nTo persist this key, set {env_key} in your environment.");
+    }
+
+    Ok(())
+}
+
+fn detect_shell_profile() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let shell = std::env::var("SHELL").unwrap_or_default();
+
+    let profile_name = if shell.contains("zsh") {
+        ".zshrc"
+    } else if shell.contains("bash") {
+        ".bashrc"
+    } else if shell.contains("fish") {
+        Some(".config/fish/config.fish")
+    } else {
+        ".profile"
+    };
+
+    let path = if shell.contains("fish") {
+        std::path::PathBuf::from(home).join(profile_name)
+    } else {
+        std::path::PathBuf::from(home).join(profile_name)
+    };
+
+    Some(path)
 }
 
 async fn run_test(config: &codex_core::config::Config, args: TestArgs) -> Result<()> {

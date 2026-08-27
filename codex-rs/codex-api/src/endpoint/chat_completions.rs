@@ -86,6 +86,10 @@ pub struct ChatCompletionsRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+    /// Reasoning effort for providers that support it (e.g., "low", "medium", "high").
+    /// This is a non-standard extension; providers that don't support it will ignore this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,6 +238,14 @@ pub fn responses_to_chat_request(request: &ResponsesApiRequest) -> ChatCompletio
         _ => Some(request.tool_choice.clone()),
     };
 
+    // Map reasoning effort from Responses API format to Chat Completions extension.
+    // This is a non-standard extension; providers that don't support it will ignore this field.
+    let reasoning_effort = request
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.effort.as_ref())
+        .map(|e| e.to_string());
+
     ChatCompletionsRequest {
         model: request.model.clone(),
         messages,
@@ -247,6 +259,7 @@ pub fn responses_to_chat_request(request: &ResponsesApiRequest) -> ChatCompletio
         temperature: None,
         max_tokens: None,
         service_tier: request.service_tier.clone(),
+        reasoning_effort,
     }
 }
 
