@@ -45,7 +45,7 @@ jobs:
         with:
           toolchain: "1.98.0"
           targets: ${{ matrix.target }}
-          components: rustfmt
+          components: rustfmt, rust-src
 
       - name: Install cross-compilation tools (Linux)
         if: runner.os == 'Linux'
